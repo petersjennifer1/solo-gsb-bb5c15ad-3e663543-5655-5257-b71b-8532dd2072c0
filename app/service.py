@@ -91,6 +91,18 @@
   (occurred_at, event_id) 升序、按事件主键去重（重叠窗口对每个窗口也只
   返回一次）；按事件当前 segment_id 实时归属分两类——当前段整体落在
   [start_ts, end_ts) 内为 fully，段还延伸到窗口之外为 partially。
+
+告警升级策略（replace_escalation_policy / list_escalations_due）：
+- replace_escalation_policy 在调用方事务（BEGIN IMMEDIATE）内原子替换某
+  source 的全部级别规则（severity 不得重复、after_seconds 必须为正）：
+  策略头 UPSERT（version 首次为 1、此后每次 +1），规则先 DELETE 再按
+  提交次序 INSERT，整体成功或回滚；只写策略两张表，不触碰事件、段、
+  变更流与确认记录；
+- list_escalations_due 在调用方提供的同一只读快照内返回截至 as_of 的
+  到期队列：段按 max_severity 与规则精确匹配，deadline = started_at +
+  after_seconds（微秒精度），仅返回 as_of >= deadline 的段，附最近一次
+  人工确认（无则 None）与策略 version，按 (deadline, segment_id) 升序；
+  来源无策略/未知来源均返回空列表；仅执行 SELECT，不改写任何表。
 """
 from __future__ import annotations
 
@@ -1458,4 +1470,164 @@ def list_maintenance_window_events(
         "window": _row_to_maintenance_window(window_row),
         "fully": fully,
         "partially": partially,
+    }
+
+
+# ---- 告警升级策略 ----
+
+def replace_escalation_policy(
+    conn: sqlite3.Connection,
+    *,
+    source: str,
+    rules: list[dict],
+) -> dict:
+    """原子替换某来源的升级策略并返回 {"source", "version", "rules"}。
+
+    - rules 为已归一化的规则列表 [{"severity": canonical, "after_seconds": float}]，
+      级别不得重复、阈值必须为正（schema 层已校验，这里重复检查作防御）；
+    - 在调用方事务（BEGIN IMMEDIATE）内执行：策略头 UPSERT（version 在原值上
+      +1，首次为 1），规则先 DELETE 再按提交次序 INSERT，整体成功或整体回滚；
+    - 仅写 escalation_policies / escalation_policy_rules 两张表，绝不触碰
+      事件、段与变更流。
+    """
+    normalized: list[tuple[str, float]] = []
+    seen: set[str] = set()
+    for rule in rules:
+        severity = sev.normalize(rule["severity"])
+        after_seconds = rule["after_seconds"]
+        if (
+            isinstance(after_seconds, bool)
+            or not isinstance(after_seconds, (int, float))
+            or not math.isfinite(after_seconds)
+            or after_seconds <= 0
+        ):
+            raise ValueError("after_seconds 必须为正数")
+        if severity in seen:
+            raise ValueError(f"升级规则级别重复: {severity}")
+        seen.add(severity)
+        normalized.append((severity, float(after_seconds)))
+
+    row = conn.execute(
+        "SELECT version FROM escalation_policies WHERE source = ?", (source,)
+    ).fetchone()
+    version = (row["version"] if row is not None else 0) + 1
+    now = time.time()
+    conn.execute(
+        """
+        INSERT INTO escalation_policies (source, version, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(source) DO UPDATE SET version = excluded.version,
+                                          updated_at = excluded.updated_at
+        """,
+        (source, version, now),
+    )
+    conn.execute("DELETE FROM escalation_policy_rules WHERE source = ?", (source,))
+    conn.executemany(
+        """
+        INSERT INTO escalation_policy_rules
+            (source, severity, after_seconds, position)
+        VALUES (?, ?, ?, ?)
+        """,
+        [
+            (source, severity, after_seconds, position)
+            for position, (severity, after_seconds) in enumerate(normalized)
+        ],
+    )
+    return {
+        "source": source,
+        "version": version,
+        "rules": [
+            {"severity": severity, "after_seconds": after_seconds}
+            for severity, after_seconds in normalized
+        ],
+    }
+
+
+def list_escalations_due(
+    conn: sqlite3.Connection,
+    *,
+    source: str,
+    as_of_ts: float,
+) -> dict:
+    """单一只读快照内返回某来源截至 as_of 的事件段升级到期队列（纯读）。
+
+    - 取该来源当前策略（不存在则无规则——未知来源/未配置策略都返回空列表，
+      policy_version 不适用）；
+    - 段按其 max_severity 与规则**精确匹配**（规则表按 (source, severity)
+      主键定位，级别不做大小于匹配，每个段至多命中一条规则）；
+    - deadline = started_at + after_seconds（微秒精度），仅返回
+      as_of >= deadline 的段（恰好等于 deadline 也返回）；
+    - 每项附该段最近一次人工确认（ack_id 最大一条；没有则为 None）及
+      查询快照中的策略 version；按 (deadline, segment_id) 升序；
+    - 仅执行 SELECT，不改写任何表；调用方应使用 read_only_session。
+    """
+    policy = conn.execute(
+        "SELECT version FROM escalation_policies WHERE source = ?", (source,)
+    ).fetchone()
+    policy_version = policy["version"] if policy is not None else None
+
+    rows = conn.execute(
+        """
+        SELECT s.id AS segment_id, s.source AS source, s.start_ts AS start_ts,
+               s.max_severity AS max_severity,
+               r.after_seconds AS after_seconds
+        FROM segments AS s
+        JOIN escalation_policy_rules AS r
+          ON r.source = s.source AND r.severity = s.max_severity
+        WHERE s.source = ?
+        ORDER BY s.id
+        """,
+        (source,),
+    ).fetchall()
+
+    due: list[tuple[float, int, sqlite3.Row]] = []
+    for row in rows:
+        # 微秒精度计算到期时刻（timedelta 内部以微秒存储），避免大 epoch
+        # 基值上的浮点尾巴误判恰好到期
+        deadline_dt = datetime.fromtimestamp(row["start_ts"], tz=timezone.utc) \
+            + timedelta(seconds=row["after_seconds"])
+        as_of_dt = datetime.fromtimestamp(as_of_ts, tz=timezone.utc)
+        if as_of_dt < deadline_dt:
+            continue
+        due.append((deadline_dt.timestamp(), row["segment_id"], row))
+
+    # 最近一次确认：同一只读快照内仅在已到期段集合中按段取 ack_id 最大的一条
+    latest_acks: dict[int, dict] = {}
+    if due:
+        due_ids = [segment_id for _, segment_id, _ in due]
+        marks = ",".join("?" * len(due_ids))
+        ack_rows = conn.execute(
+            f"""
+            SELECT a.*
+            FROM segment_acknowledgements AS a
+            JOIN (
+                SELECT segment_id, MAX(id) AS max_id
+                FROM segment_acknowledgements
+                WHERE segment_id IN ({marks})
+                GROUP BY segment_id
+            ) AS latest
+              ON latest.max_id = a.id
+            """,
+            due_ids,
+        ).fetchall()
+        latest_acks = {r["segment_id"]: _row_to_acknowledgement(r) for r in ack_rows}
+
+    items = [
+        {
+            "segment_id": segment_id,
+            "source": row["source"],
+            "severity": row["max_severity"],
+            "started_at": _iso(row["start_ts"]),
+            "deadline": _iso(deadline_ts),
+            "policy_version": policy_version,
+            "acknowledgement": latest_acks.get(segment_id),
+        }
+        for deadline_ts, segment_id, row in sorted(
+            due, key=lambda entry: (entry[0], entry[1])
+        )
+    ]
+    return {
+        "source": source,
+        "as_of": _iso(as_of_ts),
+        "escalations": items,
     }

@@ -363,3 +363,85 @@ class MaintenanceWindowEventsResponse(BaseModel):
     window: MaintenanceWindowOut
     fully: list[MaintenanceWindowEventOut]
     partially: list[MaintenanceWindowEventOut]
+
+
+class EscalationRuleIn(BaseModel):
+    """一条升级级别规则：段的 max_severity 精确匹配 severity 时，
+    以 started_at + after_seconds 计算升级到期时刻；after_seconds 必须为正数。
+    """
+
+    severity: str = Field(examples=["critical"])
+    after_seconds: float = Field(gt=0, examples=[60])
+
+    @field_validator("severity")
+    @classmethod
+    def _normalize_severity(cls, v: str) -> str:
+        try:
+            return sev.normalize(v)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+
+
+class EscalationPolicyIn(BaseModel):
+    """原子替换某来源升级策略的请求体。
+
+    - rules 给出替换后的**完整**级别规则集合（canonical 级别归一化、
+      大小写/别名不敏感），同一级别（含 warn/fatal 别名归一后）不得重复；
+    - 允许空规则列表（替换为无规则策略，该来源此后不会产生升级到期）；
+    - 任一条 after_seconds 非正或 severity 非法、级别重复均返回 422。
+    """
+
+    rules: list[EscalationRuleIn]
+
+    @field_validator("rules")
+    @classmethod
+    def _no_duplicate_severity(cls, v: list["EscalationRuleIn"]) -> list["EscalationRuleIn"]:
+        seen: set[str] = set()
+        for rule in v:
+            if rule.severity in seen:
+                raise ValueError(f"升级规则级别重复: {rule.severity}")
+            seen.add(rule.severity)
+        return v
+
+
+class EscalationRuleOut(BaseModel):
+    """一条升级级别规则；按提交次序回显。"""
+
+    severity: str
+    after_seconds: float
+
+
+class EscalationPolicyOut(BaseModel):
+    """替换成功后的策略：version 为单调递增版本号（首次替换为 1）。"""
+
+    source: str
+    version: int
+    rules: list[EscalationRuleOut]
+
+
+class EscalationDueOut(BaseModel):
+    """一条事件段升级到期队列项（单一只读快照，纯读）。
+
+    - 段按其 max_severity 与策略规则**精确匹配**（无规则的级别不入队）；
+    - deadline = 段 started_at + 规则 after_seconds，仅返回 as_of 不早于
+      deadline（as_of >= deadline，含恰好到期）的段；
+    - acknowledgement 为该段最近一次人工确认记录（按 ack_id 取最后一条），
+      从未确认时为 null；
+    - policy_version 为查询快照中该来源当前策略版本（来源无策略时为 null）。
+    """
+
+    segment_id: int
+    source: str
+    severity: str
+    started_at: datetime
+    deadline: datetime
+    policy_version: int | None
+    acknowledgement: AcknowledgementOut | None
+
+
+class EscalationsResponse(BaseModel):
+    """升级到期队列：按 (deadline, segment_id) 升序；未知来源返回空列表。"""
+
+    source: str
+    as_of: datetime
+    escalations: list[EscalationDueOut]

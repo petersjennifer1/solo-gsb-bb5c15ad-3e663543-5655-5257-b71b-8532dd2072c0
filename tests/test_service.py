@@ -2076,5 +2076,195 @@ class SegmentDurationReportTestCase(unittest.TestCase):
             self.assertEqual(service.list_segment_changes(conn), changes_before)
 
 
+class EscalationPolicyTestCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db_path = os.path.join(self.tmp.name, "test.db")
+        init_db(self.db_path)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _put(self, source, rules):
+        with session(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            return service.replace_escalation_policy(conn, source=source, rules=rules)
+
+    def _due(self, source, as_of_ts):
+        with read_only_session(self.db_path) as conn:
+            return service.list_escalations_due(
+                conn, source=source, as_of_ts=as_of_ts
+            )
+
+    def _submit(self, source, event_id, ts, severity="info"):
+        with session(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            return service.ingest_event(
+                conn, source=source, event_id=event_id, occurred_ts=ts,
+                severity=severity, silence=SILENCE,
+            )["segment"]
+
+    def test_first_replace_version_one_then_monotonic(self):
+        r = self._put("s1", [{"severity": "critical", "after_seconds": 30}])
+        self.assertEqual(r["version"], 1)
+        r = self._put("s1", [{"severity": "error", "after_seconds": 60}])
+        self.assertEqual(r["version"], 2)
+        # 空规则也使版本递增
+        r = self._put("s1", [])
+        self.assertEqual(r["version"], 3)
+        self.assertEqual(r["rules"], [])
+        # 不同来源各自从 1 开始
+        r = self._put("s2", [{"severity": "info", "after_seconds": 5}])
+        self.assertEqual(r["version"], 1)
+
+    def test_replace_is_atomic_and_echoes_rules_in_order(self):
+        rules = [
+            {"severity": "error", "after_seconds": 120.0},
+            {"severity": "CRITICAL", "after_seconds": 30.0},  # 大小写归一
+            {"severity": "fatal", "after_seconds": 10.0},    # 别名
+        ]
+        # fatal 与 critical 归一化后重复 → ValueError
+        with self.assertRaises(ValueError):
+            self._put("s1", rules)
+        # 失败不留任何策略头/规则
+        with session(self.db_path) as conn:
+            self.assertIsNone(
+                conn.execute(
+                    "SELECT 1 FROM escalation_policies WHERE source = 's1'"
+                ).fetchone()
+            )
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(*) AS n FROM escalation_policy_rules"
+                ).fetchone()["n"],
+                0,
+            )
+
+        ok = self._put("s1", rules[:2])
+        self.assertEqual(
+            ok["rules"],
+            [{"severity": "error", "after_seconds": 120.0},
+             {"severity": "critical", "after_seconds": 30.0}],
+        )
+
+    def test_non_positive_threshold_rejected(self):
+        for bad in (0, -1, float("nan"), float("inf")):
+            with self.assertRaises(ValueError):
+                self._put("s1", [{"severity": "error", "after_seconds": bad}])
+        with self.assertRaises(ValueError):
+            self._put("s1", [{"severity": "error", "after_seconds": True}])
+
+    def test_due_queue_exact_severity_match_and_deadline(self):
+        crit = self._submit("s1", "c1", 1000.0, "critical")
+        self._submit("s1", "w1", 2000.0, "warning")  # 另一独立段
+        self._submit("s2", "x1", 1000.0, "critical")  # 其他 source
+        self._put("s1", [
+            {"severity": "critical", "after_seconds": 30},
+            {"severity": "warning", "after_seconds": 10},
+        ])
+
+        # 恰好到期（as_of == deadline）返回；deadline 前一秒不返回
+        self.assertEqual(self._due("s1", 1029.0)["escalations"], [])
+        r = self._due("s1", 1030.0)
+        self.assertEqual([e["segment_id"] for e in r["escalations"]], [crit["id"]])
+        item = r["escalations"][0]
+        self.assertEqual(item["severity"], "critical")
+        self.assertEqual(item["deadline"], service._iso(1030.0))
+        self.assertEqual(item["started_at"], service._iso(1000.0))
+        self.assertEqual(item["policy_version"], 1)
+        self.assertIsNone(item["acknowledgement"])
+
+        # warning 段到期后，按 (deadline, segment_id)：warning 段 deadline=2010
+        r = self._due("s1", 3000.0)
+        self.assertEqual(
+            [(e["deadline"], e["segment_id"]) for e in r["escalations"]],
+            [(service._iso(1030.0), crit["id"]),
+             (service._iso(2010.0), r["escalations"][1]["segment_id"])],
+        )
+        # 无规则的级别（如 error 段）不入队——精确匹配而非“不低于”
+        err = self._submit("s1", "e1", 5000.0, "error")
+        r = self._due("s1", 1_000_000.0)
+        self.assertNotIn(err["id"], [e["segment_id"] for e in r["escalations"]])
+
+    def test_due_queue_ordering_by_deadline_then_segment_id(self):
+        # 更早开始的段配更长阈值，但 deadline 更晚；验证按 deadline 而非 started_at
+        a = self._submit("s1", "a", 1000.0, "error")     # deadline 1000+120=1120
+        b = self._submit("s1", "b", 1050.0, "warning")   # deadline 1050+10=1060
+        self._put("s1", [
+            {"severity": "error", "after_seconds": 120},
+            {"severity": "warning", "after_seconds": 10},
+        ])
+        r = self._due("s1", 5000.0)
+        self.assertEqual(
+            [e["segment_id"] for e in r["escalations"]], [b["id"], a["id"]]
+        )
+
+    def test_due_includes_latest_acknowledgement_only(self):
+        seg = self._submit("s1", "c1", 1000.0, "critical")["id"]
+        self._put("s1", [{"severity": "critical", "after_seconds": 1}])
+        with session(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            service.acknowledge_segment(
+                conn, segment_id=seg, operator="a", note="first",
+                expected_revision=1, idempotency_key="k1",
+            )
+            service.acknowledge_segment(
+                conn, segment_id=seg, operator="b", note="second",
+                expected_revision=1, idempotency_key="k2",
+            )
+        item = self._due("s1", 5000.0)["escalations"][0]
+        self.assertEqual(item["acknowledgement"]["operator"], "b")
+        self.assertEqual(item["acknowledgement"]["note"], "second")
+
+    def test_unknown_source_and_empty_policy_return_empty(self):
+        self._submit("s1", "c1", 1000.0, "critical")
+        # 未知来源：空队列、policy_version 不出现（无条目）
+        r = self._due("ghost", 1_000_000.0)
+        self.assertEqual(r["escalations"], [])
+        # 已知来源但无策略
+        r = self._due("s1", 1_000_000.0)
+        self.assertEqual(r["escalations"], [])
+        # 策略被空规则替换：同样无到期
+        self._put("s1", [{"severity": "critical", "after_seconds": 1}])
+        self.assertEqual(len(self._due("s1", 1_000_000.0)["escalations"]), 1)
+        self._put("s1", [])
+        self.assertEqual(self._due("s1", 1_000_000.0)["escalations"], [])
+
+    def test_policy_version_reflects_snapshot(self):
+        seg = self._submit("s1", "c1", 1000.0, "critical")
+        self._put("s1", [{"severity": "critical", "after_seconds": 30}])
+        self._put("s1", [{"severity": "critical", "after_seconds": 60}])
+        item = self._due("s1", 5000.0)["escalations"][0]
+        self.assertEqual(item["policy_version"], 2)
+        self.assertEqual(item["deadline"], service._iso(1060.0))  # 用最新阈值
+
+    def test_replace_and_query_do_not_touch_segments_events_changes(self):
+        self._submit("s1", "c1", 1000.0, "critical")
+        with session(self.db_path) as conn:
+            segs_before = service.list_segments(conn)
+            changes_before = service.list_segment_changes(conn)
+        self._put("s1", [{"severity": "critical", "after_seconds": 30}])
+        self._put("s1", [{"severity": "error", "after_seconds": 60}])
+        self._due("s1", 5000.0)
+        with read_only_session(self.db_path) as conn:
+            self.assertEqual(service.list_segments(conn), segs_before)
+            self.assertEqual(
+                service.list_segment_changes(conn), changes_before
+            )
+
+    def test_due_reads_consistent_snapshot(self):
+        self._submit("s1", "c1", 1000.0, "critical")
+        self._put("s1", [{"severity": "critical", "after_seconds": 30}])
+        with read_only_session(self.db_path) as conn:
+            r1 = service.list_escalations_due(conn, source="s1", as_of_ts=5000.0)
+            # 快照开启后替换策略并写入新段，不影响本次结果
+            self._put("s1", [{"severity": "critical", "after_seconds": 1}])
+            self._submit("s1", "c2", 9000.0, "critical")
+            r2 = service.list_escalations_due(conn, source="s1", as_of_ts=5000.0)
+        self.assertEqual(r1, r2)
+        self.assertEqual(len(r2["escalations"]), 1)
+        self.assertEqual(r2["escalations"][0]["policy_version"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

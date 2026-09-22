@@ -5,7 +5,7 @@ import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Path, Query
 from fastapi.responses import JSONResponse
 
 from .config import Settings
@@ -13,6 +13,9 @@ from .db import init_db, read_only_session, session
 from .schemas import (
     AcknowledgementIn,
     AcknowledgementOut,
+    EscalationPolicyIn,
+    EscalationPolicyOut,
+    EscalationsResponse,
     EventIn,
     EventMetricsResponse,
     EventsPage,
@@ -31,7 +34,8 @@ from .schemas import (
 from . import service
 from . import severity as sev
 
-# SQLite 单写者：进程内串行化归段写入（含撤回），配合事务保证合并/拆段一致性
+# SQLite 单写者：进程内串行化归段写入（含撤回、确认、维护窗口与升级策略替换），
+# 配合 BEGIN IMMEDIATE 事务保证一致性
 _ingest_lock = threading.Lock()
 
 
@@ -43,7 +47,7 @@ def create_app(settings: Settings) -> FastAPI:
 
     app = FastAPI(
         title="设备告警事件段聚合服务",
-        version="1.8.0",
+        version="1.9.0",
         lifespan=lifespan,
     )
 
@@ -453,6 +457,60 @@ def create_app(settings: Settings) -> FastAPI:
                 status_code=404, detail="maintenance window not found"
             )
         return result
+
+    @app.put(
+        "/escalation-policies/{source}", response_model=EscalationPolicyOut
+    )
+    def replace_escalation_policy(
+        source: str = Path(min_length=1, max_length=256),
+        policy: EscalationPolicyIn = ...,
+    ) -> dict:
+        """原子替换某来源的告警升级策略，返回单调递增的策略 version。
+
+        - 路径 ``source`` 为精确匹配的事件来源（1–256 字符）；
+        - 请求体 ``rules`` 为替换后的**完整**级别规则集合，每条含
+          ``severity``（canonical 级别，大小写/别名不敏感）与
+          ``after_seconds``（**正数**，段起点之后多少秒到期）；
+          同一级别（别名归一化后）不得重复，允许空列表；
+        - 在 ``BEGIN IMMEDIATE`` **单事务**内整体替换（规则先删后插），
+          首次替换 ``version`` 为 1，此后每次成功替换 +1；
+          策略表独立于事件/段，替换不写变更流、不改确认记录。
+        """
+        try:
+            with _ingest_lock, session(settings.database_path) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                return service.replace_escalation_policy(
+                    conn,
+                    source=source,
+                    rules=[r.model_dump() for r in policy.rules],
+                )
+        except ValueError as exc:  # 防御：重复级别/非正阈值 → 422
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/escalations", response_model=EscalationsResponse)
+    def list_escalations(
+        source: str = Query(min_length=1, max_length=256),
+        as_of: datetime = Query(...),
+    ) -> dict:
+        """查询事件段升级到期队列（**单一只读快照**，纯读）。
+
+        - ``source`` 必填、``as_of`` 必填且**必须带时区**（无时区返回 422）；
+        - 段按 ``max_severity`` 与该来源策略规则**精确匹配**，
+          ``deadline = started_at + after_seconds``，仅返回
+          ``as_of >= deadline``（含恰好到期）的段；
+        - 每项附最近一次人工确认记录（没有则为 null）与策略 version；
+          结果按 ``(deadline, segment_id)`` 升序；未知来源/未配置策略
+          返回空列表；接口纯读，不改写事件、段、变更流与策略表。
+        """
+        if as_of.tzinfo is None:
+            raise HTTPException(
+                status_code=422,
+                detail="as_of 必须带时区信息（如 2026-09-21T08:00:00Z）",
+            )
+        with read_only_session(settings.database_path) as conn:
+            return service.list_escalations_due(
+                conn, source=source, as_of_ts=as_of.timestamp()
+            )
 
     return app
 

@@ -83,6 +83,24 @@ CREATE TABLE IF NOT EXISTS maintenance_windows (
 -- 查询模式为按 source + 时间范围定位窗口
 CREATE INDEX IF NOT EXISTS idx_maintenance_source_time
     ON maintenance_windows (source, start_ts, end_ts);
+
+-- 告警升级策略：每个 source 一条策略头（version 随每次原子替换递增），
+-- 级别规则挂 source 主键。PUT 在单事务内 DELETE+INSERT 整体替换规则，
+-- 仅写这两张表，绝不触碰事件、段与变更流；CREATE TABLE IF NOT EXISTS
+-- 使已有持久化卷在启动时自动补齐，无需重建迁移
+CREATE TABLE IF NOT EXISTS escalation_policies (
+    source     TEXT PRIMARY KEY,          -- 精确匹配的事件来源（大小写敏感）
+    version    INTEGER NOT NULL,          -- 每次替换成功后单调递增（首次为 1）
+    updated_at REAL    NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS escalation_policy_rules (
+    source        TEXT    NOT NULL,
+    severity      TEXT    NOT NULL,       -- canonical 级别；段按 max_severity 精确匹配
+    after_seconds REAL    NOT NULL,       -- 段起点 started_at 之后多少秒到期（正数）
+    position      INTEGER NOT NULL,       -- 提交次序（响应按此次序回显）
+    PRIMARY KEY (source, severity)        -- 级别在同一来源内不得重复
+);
 """
 
 
