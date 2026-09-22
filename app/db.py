@@ -83,6 +83,17 @@ CREATE TABLE IF NOT EXISTS maintenance_windows (
 -- 查询模式为按 source + 时间范围定位窗口
 CREATE INDEX IF NOT EXISTS idx_maintenance_source_time
     ON maintenance_windows (source, start_ts, end_ts);
+
+-- 告警升级策略：每个 source 一条，规则集整体原子替换，version 随成功替换递增。
+-- 规则集以 JSON 数组存储于单行，替换即单条 UPSERT，不存在半新半旧中间态；
+-- 与事件/段/变更流完全独立（无外键），策略更新绝不触碰事件、段与变更流。
+-- 同其他新表，CREATE TABLE IF NOT EXISTS 使已有持久化卷在启动时自动补齐
+CREATE TABLE IF NOT EXISTS escalation_policies (
+    source     TEXT PRIMARY KEY,
+    version    INTEGER NOT NULL,          -- 每次成功替换 +1，按 source 独立从 1 起
+    rules      TEXT    NOT NULL,          -- JSON: [{"severity": "...", "after_seconds": ...}]
+    updated_at REAL    NOT NULL
+);
 """
 
 

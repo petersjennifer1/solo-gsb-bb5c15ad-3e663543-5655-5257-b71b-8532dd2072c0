@@ -1,6 +1,6 @@
 # 设备告警事件段聚合服务
 
-基于 FastAPI + SQLite 的告警汇聚服务：客户端上报离散告警事件，服务按 **source + 可配置静默间隔** 将乱序到达的事件归入同一事件段（segment），并保证 **event_id 幂等去重**——重复提交不改变任何计数。误报事件可通过 `DELETE /events/{source}/{event_id}` 撤回，服务在单事务内删除事件并按静默间隔重算其原段（删除/收缩/拆分）。`GET /events` 提供事件审计查询：在单一只读快照内按 `(occurred_at, event_id)` 稳定排序、支持时间窗与 severity 多值过滤及游标分页；`GET /events/metrics` 在同一只读快照内按 `occurred_at` 将事件划入**左闭右开**等宽时间桶，返回每桶各 severity 计数、事件总数与涉及的不同 segment_id 数（无事件桶照常输出、按时间升序）。每次段变更都会同事务写入**单调递增的变更流**，下游可通过 `GET /segment-changes` 做增量同步，并通过 `GET /segments/snapshot` 按**变更水位**重建任一历史时刻的段状态快照。运维人员可通过 `POST /segments/{id}/acknowledgements` 对事件段做**人工确认**：在事务内校验段的当前 revision 后追加**不可变**的确认审计记录（幂等键防重），并通过 `GET /segments/{id}/acknowledgements` 按确认序号升序查询。`POST /maintenance-windows` 可登记 **[start_at, end_at) 左闭右开、source 精确匹配的维护窗口**（允许重叠、事务化写入），`GET /maintenance-windows/{id}/events` 在**单一只读快照**内返回窗口覆盖的事件及其**当前 segment_id**，并按事件当前所在段划分为 `fully`（段整体在窗口内）与 `partially`（段还延伸到窗口之外）两类、按事件时间升序返回。`GET /segments/patterns` 在**单一只读快照**内扫描当前事件，提取每个 segment 内按发生时间排序的 **severity 序列**，以可配置的**连续窗口长度**生成规范化模式指纹，按指纹分组返回出现次数、涉及的 segment_id/source 及首次/最近发生时间。`GET /segments/duration-report` 在**单一只读快照**内统计**当前事件段的持续时长分布**：按可选 source 与闭区间时间窗筛选（段的时间范围与窗口有交集即纳入），计算每段 `ended_at - started_at` 的持续秒数，返回样本数、最短/最长、均值、中位数、P90，并按可配置 `bucket_seconds` 生成**左闭右开**时长桶（空桶照常输出、按桶序稳定输出）。
+基于 FastAPI + SQLite 的告警汇聚服务：客户端上报离散告警事件，服务按 **source + 可配置静默间隔** 将乱序到达的事件归入同一事件段（segment），并保证 **event_id 幂等去重**——重复提交不改变任何计数。误报事件可通过 `DELETE /events/{source}/{event_id}` 撤回，服务在单事务内删除事件并按静默间隔重算其原段（删除/收缩/拆分）。`GET /events` 提供事件审计查询：在单一只读快照内按 `(occurred_at, event_id)` 稳定排序、支持时间窗与 severity 多值过滤及游标分页；`GET /events/metrics` 在同一只读快照内按 `occurred_at` 将事件划入**左闭右开**等宽时间桶，返回每桶各 severity 计数、事件总数与涉及的不同 segment_id 数（无事件桶照常输出、按时间升序）。每次段变更都会同事务写入**单调递增的变更流**，下游可通过 `GET /segment-changes` 做增量同步，并通过 `GET /segments/snapshot` 按**变更水位**重建任一历史时刻的段状态快照。运维人员可通过 `POST /segments/{id}/acknowledgements` 对事件段做**人工确认**：在事务内校验段的当前 revision 后追加**不可变**的确认审计记录（幂等键防重），并通过 `GET /segments/{id}/acknowledgements` 按确认序号升序查询。`POST /maintenance-windows` 可登记 **[start_at, end_at) 左闭右开、source 精确匹配的维护窗口**（允许重叠、事务化写入），`GET /maintenance-windows/{id}/events` 在**单一只读快照**内返回窗口覆盖的事件及其**当前 segment_id**，并按事件当前所在段划分为 `fully`（段整体在窗口内）与 `partially`（段还延伸到窗口之外）两类、按事件时间升序返回。`GET /segments/patterns` 在**单一只读快照**内扫描当前事件，提取每个 segment 内按发生时间排序的 **severity 序列**，以可配置的**连续窗口长度**生成规范化模式指纹，按指纹分组返回出现次数、涉及的 segment_id/source 及首次/最近发生时间。`GET /segments/duration-report` 在**单一只读快照**内统计**当前事件段的持续时长分布**：按可选 source 与闭区间时间窗筛选（段的时间范围与窗口有交集即纳入），计算每段 `ended_at - started_at` 的持续秒数，返回样本数、最短/最长、均值、中位数、P90，并按可配置 `bucket_seconds` 生成**左闭右开**时长桶（空桶照常输出、按桶序稳定输出）。`PUT /escalation-policies/{source}` 以**原子替换**方式配置某来源的**告警升级策略**（每条规则含 `severity` 与 `after_seconds`，级别不得重复），成功后返回**递增的策略 version**；`GET /escalations` 在**单一只读快照**内返回**事件段到期队列**：按段的 `max_severity` 精确匹配规则，以 `started_at + after_seconds` 计算到期时刻 `deadline`，仅返回 `as_of` 不早于 `deadline` 的段，每条附该段**最近一次确认记录**（没有则为 `null`）与策略 version，结果按 `(deadline, segment_id)` 升序。
 
 ## 快速开始
 
@@ -534,6 +534,87 @@ curl 'http://localhost:8000/segments/duration-report?source=edge-gateway-01&star
 - **快照一致性与纯读**：全部读取在同一只读事务快照内完成，请求期间的并发写入不影响本次结果，不会改写事件、段或变更流；相同入参的重复请求结果确定一致。
 - 参数校验失败（缺 `bucket_seconds`、桶长非正/非数字/不足 1 微秒、非法时间、`start_at > end_at`、空 `source`、桶数超上限）统一返回 `422`。
 
+### 配置告警升级策略 `PUT /escalation-policies/{source}`
+
+以**原子替换**方式配置某来源的告警升级策略：请求体的规则集**整体替换**该来源现有规则（单事务内单条 UPSERT，不存在半新半旧的中间态），成功后返回**递增的策略 `version`**（按 source 独立从 1 起，每次成功替换 +1）。策略表独立于事件/段，更新策略**不改写任何事件、段或变更流**。
+
+```bash
+curl -X PUT http://localhost:8000/escalation-policies/edge-gateway-01 \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "rules": [
+      {"severity": "critical", "after_seconds": 300},
+      {"severity": "warning", "after_seconds": 900}
+    ]
+  }'
+```
+
+```json
+{
+  "source": "edge-gateway-01",
+  "version": 3,
+  "rules": [
+    {"severity": "critical", "after_seconds": 300.0},
+    {"severity": "warning", "after_seconds": 900.0}
+  ],
+  "updated_at": "2026-09-21T08:00:00+00:00"
+}
+```
+
+- 每条规则含 `severity`（大小写不敏感，接受 `warn`/`fatal` 别名，按归一化后的 canonical 级别存储）与 `after_seconds`（秒，**正数**，支持小数）——段最高级别为该级别时，段开始 `after_seconds` 后进入到期队列。
+- **级别不得重复**：归一化后重复（如 `warn` 与 `WARNING`）返回 `422`；`after_seconds` 非正（`0`、负数）或非数字、级别非法、缺字段同样返回 `422`。
+- **校验失败不落库**：返回 `422` 的请求不替换规则、不递增 `version`；`rules` 为空列表是合法替换（清空该来源全部规则，`version` 照常递增）。
+
+### 查询事件段到期队列 `GET /escalations`
+
+返回某来源**已到期未升级**的事件段队列。整个请求在**单一只读快照事务**（`query_only` 连接）内完成：对该来源的每个**当前**事件段，按段的 `max_severity` **精确匹配**策略规则（级别在事件入库与策略写入时均已归一化），以 `deadline = started_at + 命中规则的 after_seconds` 计算到期时刻，仅返回 `as_of` **不早于** `deadline`（含恰好相等）的段；无匹配规则的段不进入队列。
+
+```bash
+curl 'http://localhost:8000/escalations?source=edge-gateway-01&as_of=2026-09-21T08:00:00Z'
+```
+
+```json
+{
+  "source": "edge-gateway-01",
+  "as_of": "2026-09-21T08:00:00+00:00",
+  "policy_version": 3,
+  "escalations": [
+    {
+      "segment_id": 7,
+      "source": "edge-gateway-01",
+      "started_at": "2026-09-21T07:50:00+00:00",
+      "ended_at": "2026-09-21T07:54:11+00:00",
+      "max_severity": "critical",
+      "after_seconds": 300.0,
+      "deadline": "2026-09-21T07:55:00+00:00",
+      "last_acknowledgement": {
+        "ack_id": 4,
+        "segment_id": 7,
+        "operator": "ops-alice",
+        "note": "已确认，通知值班处理",
+        "expected_revision": 2,
+        "segment_revision": 2,
+        "idempotency_key": "ack-20260921-0001",
+        "created_at": "2026-09-21T07:52:00+00:00"
+      }
+    }
+  ]
+}
+```
+
+查询参数：
+
+| 参数 | 必填 | 说明 |
+| --- | --- | --- |
+| `source` | 是 | 只返回该来源的到期段（1–256 字符） |
+| `as_of` | 是 | 队列判定时刻，ISO 8601 且**必须携带时区**（如 `Z` 或 `+08:00`）；无时区或非法格式返回 `422`，带偏移的时区先换算到 UTC |
+
+- **排序**：结果按 `(deadline, segment_id)` **升序**——最紧急（到期最早）的段排在最前，到期时刻相同按段 id 升序。
+- **`last_acknowledgement`**：该段**最近一次**人工确认记录（确认序号最大者，字段同 `GET /segments/{id}/acknowledgements` 的元素）；从未确认为 `null`。
+- **`policy_version`**：本次匹配所用策略的版本；**未知来源（含未配置策略的来源）返回空队列**，`policy_version` 为 `null`、`escalations` 为空列表。
+- **段为查询时刻的实时状态**：迟到合并、误报撤回拆段后，队列按重算后的当前段重新匹配与计算 deadline。
+- **快照一致性与纯读**：策略、段与确认记录在同一快照内读取，请求期间的并发写入不影响本次结果；查询不改写事件、段、变更流或策略。
+
 ### 健康检查 `GET /healthz`
 
 ## 归段与 revision 规则
@@ -546,6 +627,7 @@ curl 'http://localhost:8000/segments/duration-report?source=edge-gateway-01&star
 - 需要回看历史时，用 `GET /segments/snapshot` 按变更水位重建任一时刻的段状态（`upsert` 快照保留、`merged`/`deleted` 墓碑移除该段），与增量同步共用同一条变更流，互不影响。
 - 人工确认（`POST /segments/{id}/acknowledgements`）仅追加审计记录，不改变段的 `revision`、不写变更流；确认记录独立于段的生命周期，段被合并或撤回删除后审计记录仍完整保留。
 - 维护窗口（`POST /maintenance-windows` / `GET /maintenance-windows/{id}/events`）是独立的抑制元数据：左闭右开、source 精确匹配、允许重叠，事务化写入、纯读查询，绝不修改事件、段与变更流；覆盖事件的 `segment_id` 按查询时刻实时归属返回，并随撤回/重分段自动反映最新结果。
+- 告警升级策略（`PUT /escalation-policies/{source}` / `GET /escalations`）同样是独立元数据：规则集原子替换、`version` 按 source 递增，到期队列在单一只读快照内按当前段的 `max_severity` 精确匹配规则计算，绝不修改事件、段与变更流。
 - 想评估调整 `SILENCE_INTERVAL_SECONDS` 的影响时，调用重分段预演接口（见 `GET /segments/resegmentation-preview`），可在不改动任何数据的前提下查看模拟段与现有段的 split/merged 映射。
 
 ## 本地开发与测试
@@ -568,7 +650,7 @@ python3 -m unittest tests.test_service -v
 ```
 app/
   main.py      # FastAPI 路由与生命周期（启动时幂等建表）
-  service.py   # 归段/合并/去重/撤回核心逻辑、事件审计查询、时间桶统计、严重性序列模式指纹、持续时长分布报告与变更水位快照
+  service.py   # 归段/合并/去重/撤回核心逻辑、事件审计查询、时间桶统计、严重性序列模式指纹、持续时长分布报告、变更水位快照与告警升级策略
   schemas.py   # 请求/响应模型与校验
   severity.py  # 告警级别定义、排序与 canonical 级别表
   db.py        # SQLite 连接、schema、事务

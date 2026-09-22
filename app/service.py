@@ -91,6 +91,19 @@
   (occurred_at, event_id) 升序、按事件主键去重（重叠窗口对每个窗口也只
   返回一次）；按事件当前 segment_id 实时归属分两类——当前段整体落在
   [start_ts, end_ts) 内为 fully，段还延伸到窗口之外为 partially。
+
+告警升级策略（replace_escalation_policy / list_escalations）：
+- 每个 source 一条策略，规则集（severity + after_seconds）整体原子替换：
+  单条 UPSERT 落库，version 按 source 独立从 1 起、每次成功替换 +1；
+  级别（已归一化）重复或阈值非正/非有限时抛 ValueError（调用方回 422），
+  校验失败不落库、version 不递增；仅写 escalation_policies 表，
+  不触碰事件、段与变更流；
+- 到期队列查询在调用方提供的同一只读快照内完成：对该 source 的每个当前
+  事件段，按段的 max_severity 精确匹配规则，deadline = started_at +
+  after_seconds；仅返回 as_of 不早于 deadline（含恰好相等）的段，
+  每条附该段最近一次确认记录（没有则为 None）与策略 version，
+  结果按 (deadline, segment_id) 升序；来源未配置策略时返回空队列
+  （policy_version 为 None）；仅执行 SELECT，不改写任何表。
 """
 from __future__ import annotations
 
@@ -1459,3 +1472,150 @@ def list_maintenance_window_events(
         "fully": fully,
         "partially": partially,
     }
+
+
+def _row_to_escalation_policy(row: sqlite3.Row) -> dict:
+    return {
+        "source": row["source"],
+        "version": row["version"],
+        "rules": json.loads(row["rules"]),
+        "updated_at": _iso(row["updated_at"]),
+    }
+
+
+def replace_escalation_policy(
+    conn: sqlite3.Connection, *, source: str, rules: list[dict]
+) -> dict:
+    """原子替换某来源的升级策略规则集并返回新策略（version 递增）。
+
+    调用方需持有事务（建议 BEGIN IMMEDIATE）并保证串行化。
+
+    - rules 每条含 severity（须已归一化为 canonical 级别）与 after_seconds；
+      级别重复、阈值非正/非有限时抛 ValueError（调用方回 422）——校验
+      先于任何写入，失败不落库、version 不递增；
+    - 替换为单条 UPSERT：规则集整体生效，不存在半新半旧的中间态；
+      version 按 source 独立从 1 起、每次成功替换 +1；
+    - 仅写 escalation_policies 表，不触碰事件、段与变更流。
+    """
+    seen: set[str] = set()
+    for rule in rules:
+        severity = rule["severity"]
+        if severity in seen:
+            raise ValueError(f"重复级别: {severity}")
+        seen.add(severity)
+        after_seconds = rule["after_seconds"]
+        if (
+            isinstance(after_seconds, bool)
+            or not isinstance(after_seconds, (int, float))
+            or not math.isfinite(after_seconds)
+            or after_seconds <= 0
+        ):
+            raise ValueError("after_seconds 必须为正数")
+
+    now = time.time()
+    payload = json.dumps(
+        [
+            {"severity": r["severity"], "after_seconds": float(r["after_seconds"])}
+            for r in rules
+        ],
+        separators=(",", ":"),
+    )
+    conn.execute(
+        """
+        INSERT INTO escalation_policies (source, version, rules, updated_at)
+        VALUES (?, 1, ?, ?)
+        ON CONFLICT(source) DO UPDATE SET
+            version = version + 1,
+            rules = excluded.rules,
+            updated_at = excluded.updated_at
+        """,
+        (source, payload, now),
+    )
+    row = conn.execute(
+        "SELECT * FROM escalation_policies WHERE source = ?", (source,)
+    ).fetchone()
+    return _row_to_escalation_policy(row)
+
+
+def list_escalations(
+    conn: sqlite3.Connection, *, source: str, as_of_ts: float
+) -> dict:
+    """事件段到期升级队列（纯读）：按策略规则计算 as_of 时刻已到期的段。
+
+    - 该 source 未配置策略时返回空队列（policy_version 为 None）；
+    - 对该 source 的每个**当前**事件段，用段的 max_severity 精确匹配规则
+      （级别在事件入库与策略写入时均已归一化），无匹配规则的段不进队列；
+    - 段的到期时刻 deadline = started_at + 命中规则的 after_seconds；
+      仅当 as_of 不早于 deadline（as_of >= deadline，恰好相等也算到期）
+      才返回；deadline 用 datetime/timedelta 微秒精度计算，避免大 epoch
+      基值上的浮点误差；
+    - 每条附该段最近一次人工确认记录（ack id 最大者，没有则为 None），
+      结果按 (deadline, segment_id) 升序，响应携带策略 version；
+    - 只执行 SELECT：多次访问共享同一快照，不改写事件、段、变更流或策略。
+
+    调用方应使用 read_only_session：全部读取在同一快照内完成。
+    """
+    result = {
+        "source": source,
+        "as_of": _iso(as_of_ts),
+        "policy_version": None,
+        "escalations": [],
+    }
+    policy = conn.execute(
+        "SELECT * FROM escalation_policies WHERE source = ?", (source,)
+    ).fetchone()
+    if policy is None:
+        return result
+
+    rules = json.loads(policy["rules"])
+    thresholds = {r["severity"]: r["after_seconds"] for r in rules}
+    result["policy_version"] = policy["version"]
+
+    as_of_dt = datetime.fromtimestamp(as_of_ts, tz=timezone.utc)
+    segments = conn.execute(
+        "SELECT * FROM segments WHERE source = ? ORDER BY id", (source,)
+    ).fetchall()
+
+    # 同一快照内取这些段的最近一次确认记录（ack id 单调递增，最大即最近）
+    latest_acks: dict[int, dict] = {}
+    if segments:
+        ack_rows = conn.execute(
+            """
+            SELECT a.* FROM segment_acknowledgements a
+            JOIN segments s ON s.id = a.segment_id
+            WHERE s.source = ?
+            ORDER BY a.id
+            """,
+            (source,),
+        ).fetchall()
+        for row in ack_rows:  # id 升序遍历，后者覆盖前者 → 每段保留最新一条
+            latest_acks[row["segment_id"]] = _row_to_acknowledgement(row)
+
+    due: list[tuple[datetime, int, dict]] = []
+    for seg in segments:
+        after_seconds = thresholds.get(seg["max_severity"])
+        if after_seconds is None:
+            continue
+        start_dt = datetime.fromtimestamp(seg["start_ts"], tz=timezone.utc)
+        deadline_dt = start_dt + timedelta(seconds=after_seconds)
+        if as_of_dt < deadline_dt:  # as_of 早于 deadline：尚未到期
+            continue
+        due.append(
+            (
+                deadline_dt,
+                seg["id"],
+                {
+                    "segment_id": seg["id"],
+                    "source": seg["source"],
+                    "started_at": _iso(seg["start_ts"]),
+                    "ended_at": _iso(seg["end_ts"]),
+                    "max_severity": seg["max_severity"],
+                    "after_seconds": float(after_seconds),
+                    "deadline": deadline_dt.isoformat(),
+                    "last_acknowledgement": latest_acks.get(seg["id"]),
+                },
+            )
+        )
+    due.sort(key=lambda item: (item[0], item[1]))
+    result["escalations"] = [item for _, _, item in due]
+    return result

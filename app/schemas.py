@@ -363,3 +363,64 @@ class MaintenanceWindowEventsResponse(BaseModel):
     window: MaintenanceWindowOut
     fully: list[MaintenanceWindowEventOut]
     partially: list[MaintenanceWindowEventOut]
+
+
+class EscalationRuleIn(BaseModel):
+    """一条升级规则：段的最高级别为 severity 时，段开始 after_seconds 后到期。"""
+
+    severity: str = Field(examples=["critical"])
+    after_seconds: float = Field(gt=0, examples=[600])
+
+    @field_validator("severity")
+    @classmethod
+    def _normalize_severity(cls, v: str) -> str:
+        try:
+            return sev.normalize(v)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+
+
+class EscalationPolicyIn(BaseModel):
+    """升级策略整体替换请求：rules 原子替换该来源的全部级别规则。"""
+
+    rules: list[EscalationRuleIn]
+
+
+class EscalationRuleOut(BaseModel):
+    severity: str
+    after_seconds: float
+
+
+class EscalationPolicyOut(BaseModel):
+    """替换后的升级策略：version 按 source 独立递增（首次为 1）。"""
+
+    source: str
+    version: int
+    rules: list[EscalationRuleOut]
+    updated_at: datetime
+
+
+class EscalationOut(BaseModel):
+    """到期队列中的一个事件段：段要素 + 命中规则阈值 + 到期时刻 + 最近一次确认。"""
+
+    segment_id: int
+    source: str
+    started_at: datetime
+    ended_at: datetime
+    max_severity: str
+    after_seconds: float
+    deadline: datetime
+    last_acknowledgement: AcknowledgementOut | None
+
+
+class EscalationQueueResponse(BaseModel):
+    """事件段到期升级队列（单一只读快照，纯读）。
+
+    policy_version 为本次匹配所用策略的版本；来源未配置策略时为 null
+    且 escalations 为空列表。
+    """
+
+    source: str
+    as_of: datetime
+    policy_version: int | None
+    escalations: list[EscalationOut]

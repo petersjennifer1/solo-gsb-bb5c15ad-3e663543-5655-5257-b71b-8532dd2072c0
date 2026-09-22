@@ -13,6 +13,9 @@ from .db import init_db, read_only_session, session
 from .schemas import (
     AcknowledgementIn,
     AcknowledgementOut,
+    EscalationPolicyIn,
+    EscalationPolicyOut,
+    EscalationQueueResponse,
     EventIn,
     EventMetricsResponse,
     EventsPage,
@@ -43,7 +46,7 @@ def create_app(settings: Settings) -> FastAPI:
 
     app = FastAPI(
         title="设备告警事件段聚合服务",
-        version="1.8.0",
+        version="1.9.0",
         lifespan=lifespan,
     )
 
@@ -453,6 +456,58 @@ def create_app(settings: Settings) -> FastAPI:
                 status_code=404, detail="maintenance window not found"
             )
         return result
+
+    @app.put(
+        "/escalation-policies/{source}",
+        response_model=EscalationPolicyOut,
+    )
+    def put_escalation_policy(source: str, policy: EscalationPolicyIn) -> dict:
+        """原子替换某来源的告警升级策略（级别规则集）。
+
+        - 请求体 ``{"rules": [{"severity": ..., "after_seconds": ...}, ...]}``：
+          severity 大小写不敏感并接受 ``warn``/``fatal`` 别名（归一化后
+          级别不得重复），``after_seconds`` 必须为正数；重复级别、非正
+          阈值或非法级别返回 422，校验失败不落库、version 不递增；
+        - 替换在 ``BEGIN IMMEDIATE`` 单事务内以单条 UPSERT 完成：规则集
+          整体生效，不存在半新半旧中间态；成功后 version 递增
+          （按 source 独立从 1 起）；
+        - 仅写策略表，不改写事件、段及变更流。
+        """
+        try:
+            with _ingest_lock, session(settings.database_path) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                return service.replace_escalation_policy(
+                    conn,
+                    source=source,
+                    rules=[r.model_dump() for r in policy.rules],
+                )
+        except ValueError as exc:  # 重复级别/非正阈值 → 422
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/escalations", response_model=EscalationQueueResponse)
+    def list_escalations(
+        source: str = Query(min_length=1, max_length=256),
+        as_of: datetime = Query(...),
+    ) -> dict:
+        """事件段到期升级队列（**单一只读快照**，纯读）。
+
+        - ``source`` 必填；``as_of`` 必填且**必须携带时区**（ISO 8601；
+          无时区或非法格式返回 422），带偏移的时区先换算到 UTC；
+        - 该来源未配置策略时返回空队列（``policy_version`` 为 null）；
+        - 对该来源的每个当前事件段，按其 ``max_severity`` 精确匹配策略
+          规则，``deadline = started_at + after_seconds``；仅返回
+          ``as_of`` 不早于 deadline（含恰好相等）的段；
+        - 每条附该段最近一次确认记录（没有则为 null），响应携带策略
+          version；结果按 ``(deadline, segment_id)`` 升序；
+        - 全程纯读（query_only 连接），不改写事件、段、变更流或策略。
+        """
+        if as_of.tzinfo is None:
+            raise HTTPException(status_code=422, detail="as_of 必须携带时区")
+        as_of_utc = as_of.astimezone(timezone.utc)
+        with read_only_session(settings.database_path) as conn:
+            return service.list_escalations(
+                conn, source=source, as_of_ts=as_of_utc.timestamp()
+            )
 
     return app
 

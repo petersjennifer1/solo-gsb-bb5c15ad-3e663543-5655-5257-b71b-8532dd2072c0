@@ -2076,5 +2076,284 @@ class SegmentDurationReportTestCase(unittest.TestCase):
             self.assertEqual(service.list_segment_changes(conn), changes_before)
 
 
+class EscalationPolicyTestCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db_path = os.path.join(self.tmp.name, "test.db")
+        init_db(self.db_path)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def submit(self, source, event_id, occurred_ts, severity="info"):
+        with session(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            return service.ingest_event(
+                conn,
+                source=source,
+                event_id=event_id,
+                occurred_ts=occurred_ts,
+                severity=severity,
+                silence=SILENCE,
+            )
+
+    def withdraw(self, source, event_id):
+        with session(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            return service.withdraw_event(
+                conn, source=source, event_id=event_id, silence=SILENCE
+            )
+
+    def ack(self, segment_id, *, operator="ops", note="n",
+            expected_revision=1, key="k1"):
+        with session(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            return service.acknowledge_segment(
+                conn,
+                segment_id=segment_id,
+                operator=operator,
+                note=note,
+                expected_revision=expected_revision,
+                idempotency_key=key,
+            )
+
+    def put_policy(self, source, rules):
+        with session(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            return service.replace_escalation_policy(
+                conn, source=source, rules=rules
+            )
+
+    def escalations(self, source, as_of_ts):
+        with read_only_session(self.db_path) as conn:
+            return service.list_escalations(
+                conn, source=source, as_of_ts=as_of_ts
+            )
+
+    def test_replace_returns_incrementing_version_per_source(self):
+        p = self.put_policy("s1", [{"severity": "critical", "after_seconds": 300}])
+        self.assertEqual(p["source"], "s1")
+        self.assertEqual(p["version"], 1)
+        self.assertEqual(
+            p["rules"], [{"severity": "critical", "after_seconds": 300.0}]
+        )
+        self.assertTrue(p["updated_at"])
+
+        p = self.put_policy("s1", [{"severity": "warning", "after_seconds": 60}])
+        self.assertEqual(p["version"], 2)  # 每次成功替换 +1
+        self.assertEqual(
+            p["rules"], [{"severity": "warning", "after_seconds": 60.0}]
+        )
+        # version 按 source 独立递增
+        p = self.put_policy("s2", [{"severity": "info", "after_seconds": 10}])
+        self.assertEqual(p["version"], 1)
+
+    def test_replace_is_atomic_and_swaps_entire_rule_set(self):
+        self.submit("s1", "e1", 1000.0, "critical")
+        self.submit("s1", "e2", 1020.0, "warning")
+        self.put_policy("s1", [{"severity": "critical", "after_seconds": 5}])
+        r = self.escalations("s1", 1010.0)
+        self.assertEqual(len(r["escalations"]), 1)  # 仅 critical 段到期
+        # 整体替换为 warning 规则：critical 规则不再生效
+        self.put_policy("s1", [{"severity": "warning", "after_seconds": 5}])
+        r = self.escalations("s1", 1030.0)
+        self.assertEqual(len(r["escalations"]), 1)
+        self.assertEqual(r["escalations"][0]["max_severity"], "warning")
+        self.assertEqual(r["policy_version"], 2)
+
+    def test_replace_rejects_duplicate_severity(self):
+        with self.assertRaises(ValueError):
+            self.put_policy("s1", [
+                {"severity": "warning", "after_seconds": 10},
+                {"severity": "warning", "after_seconds": 20},
+            ])
+        # 校验失败不落库：来源仍视为未配置
+        r = self.escalations("s1", 10**9)
+        self.assertEqual(r["escalations"], [])
+        self.assertIsNone(r["policy_version"])
+
+    def test_replace_rejects_non_positive_or_non_finite_threshold(self):
+        for bad in (0, -1, -0.5, float("nan"), float("inf"), True, "10"):
+            with self.assertRaises(ValueError):
+                self.put_policy(
+                    "s1", [{"severity": "info", "after_seconds": bad}]
+                )
+        self.assertIsNone(self.escalations("s1", 10**9)["policy_version"])
+
+    def test_failed_replace_does_not_bump_version(self):
+        self.put_policy("s1", [{"severity": "info", "after_seconds": 10}])
+        with self.assertRaises(ValueError):
+            self.put_policy("s1", [
+                {"severity": "info", "after_seconds": 10},
+                {"severity": "info", "after_seconds": 20},
+            ])
+        p = self.put_policy("s1", [{"severity": "error", "after_seconds": 10}])
+        self.assertEqual(p["version"], 2)  # 失败不占版本号
+
+    def test_empty_rules_allowed_and_match_nothing(self):
+        self.submit("s1", "e1", 1000.0, "critical")
+        p = self.put_policy("s1", [])
+        self.assertEqual(p["version"], 1)
+        self.assertEqual(p["rules"], [])
+        r = self.escalations("s1", 10**9)
+        self.assertEqual(r["policy_version"], 1)
+        self.assertEqual(r["escalations"], [])
+
+    def test_unknown_source_returns_empty_queue(self):
+        r = self.escalations("ghost", 1000.0)
+        self.assertEqual(
+            r,
+            {
+                "source": "ghost",
+                "as_of": service._iso(1000.0),
+                "policy_version": None,
+                "escalations": [],
+            },
+        )
+
+    def test_queue_matches_max_severity_and_deadline(self):
+        # SILENCE=10：段 A [1000,1005] max critical；段 B [1020] max warning；
+        # 段 C [1040] max debug（无匹配规则，永不进队列）
+        self.submit("s1", "e1", 1000.0, "critical")
+        self.submit("s1", "e2", 1005.0, "info")
+        self.submit("s1", "e3", 1020.0, "warning")
+        self.submit("s1", "e4", 1040.0, "debug")
+        self.put_policy("s1", [
+            {"severity": "critical", "after_seconds": 300},
+            {"severity": "warning", "after_seconds": 60},
+        ])
+
+        # 未到期：deadline 分别为 1300 与 1080
+        self.assertEqual(self.escalations("s1", 1079.0)["escalations"], [])
+        # as_of 恰好等于 deadline：到期（不早于即含）
+        r = self.escalations("s1", 1080.0)
+        self.assertEqual(len(r["escalations"]), 1)
+        item = r["escalations"][0]
+        self.assertEqual(item["max_severity"], "warning")
+        self.assertEqual(item["deadline"], service._iso(1080.0))
+        self.assertEqual(item["after_seconds"], 60.0)
+        self.assertIsNone(item["last_acknowledgement"])
+        # 全部到期后按 (deadline, segment_id) 升序：B(1080) 在 A(1300) 前
+        r = self.escalations("s1", 1300.0)
+        self.assertEqual(
+            [e["max_severity"] for e in r["escalations"]],
+            ["warning", "critical"],
+        )
+        self.assertEqual(r["policy_version"], 1)
+        # debug 段无匹配规则，始终不出现
+        self.assertNotIn(
+            "debug", [e["max_severity"] for e in r["escalations"]]
+        )
+
+    def test_queue_sorted_by_deadline_then_segment_id(self):
+        # 段 A [1000] critical（deadline 1600）；段 B [1020] error
+        # （deadline 1600，与 A 相同）；段 C [1040] warning（deadline 1100）
+        self.submit("s1", "e1", 1000.0, "critical")
+        self.submit("s1", "e2", 1020.0, "error")
+        self.submit("s1", "e3", 1040.0, "warning")
+        self.put_policy("s1", [
+            {"severity": "critical", "after_seconds": 600},
+            {"severity": "error", "after_seconds": 580},
+            {"severity": "warning", "after_seconds": 60},
+        ])
+        r = self.escalations("s1", 2000.0)
+        items = r["escalations"]
+        self.assertEqual(len(items), 3)
+        # deadline 相同（1600）时按 segment_id 升序；整体按 deadline 升序
+        self.assertEqual(
+            [(e["deadline"], e["segment_id"]) for e in items],
+            sorted((e["deadline"], e["segment_id"]) for e in items),
+        )
+        self.assertEqual(items[0]["max_severity"], "warning")     # 1100
+        self.assertEqual(items[1]["max_severity"], "critical")    # 1600, id 小
+        self.assertEqual(items[2]["max_severity"], "error")       # 1600, id 大
+
+    def test_queue_attaches_latest_acknowledgement(self):
+        seg = self.submit("s1", "e1", 1000.0, "critical")["segment"]
+        self.put_policy("s1", [{"severity": "critical", "after_seconds": 10}])
+        r = self.escalations("s1", 2000.0)
+        self.assertIsNone(r["escalations"][0]["last_acknowledgement"])
+
+        first = self.ack(seg["id"], key="k1")["acknowledgement"]
+        r = self.escalations("s1", 2000.0)
+        self.assertEqual(r["escalations"][0]["last_acknowledgement"], first)
+
+        # 段升级后再确认：返回最近一次记录
+        self.submit("s1", "e2", 1005.0, "critical")  # 扩边界 → rev=2
+        second = self.ack(seg["id"], key="k2", expected_revision=2)[
+            "acknowledgement"
+        ]
+        r = self.escalations("s1", 2000.0)
+        self.assertEqual(r["escalations"][0]["last_acknowledgement"], second)
+        self.assertGreater(second["ack_id"], first["ack_id"])
+
+    def test_queue_tracks_current_segments_after_withdraw(self):
+        # 桥接合并为单段 [1000,1020]；撤回桥接事件后拆成两段
+        a = self.submit("s1", "e1", 1000.0, "critical")["segment"]
+        self.submit("s1", "e2", 1020.0, "critical")
+        self.submit("s1", "bridge", 1010.0, "critical")
+        self.put_policy("s1", [{"severity": "critical", "after_seconds": 60}])
+        r = self.escalations("s1", 1100.0)
+        self.assertEqual(len(r["escalations"]), 1)  # 单段 deadline 1060
+
+        self.withdraw("s1", "bridge")  # 拆成 [1000] 与 [1020] 两段
+        r = self.escalations("s1", 1100.0)
+        items = r["escalations"]
+        self.assertEqual(len(items), 2)  # deadline 1060 与 1080
+        self.assertEqual(items[0]["segment_id"], a["id"])
+        self.assertEqual(items[0]["deadline"], service._iso(1060.0))
+        self.assertEqual(items[1]["deadline"], service._iso(1080.0))
+
+    def test_queue_is_isolated_by_source(self):
+        self.submit("s1", "e1", 1000.0, "critical")
+        self.submit("s2", "e2", 1000.0, "critical")
+        self.put_policy("s1", [{"severity": "critical", "after_seconds": 10}])
+        r = self.escalations("s1", 2000.0)
+        self.assertEqual(len(r["escalations"]), 1)
+        self.assertEqual(r["escalations"][0]["source"], "s1")
+        # s2 未配置策略：空队列
+        self.assertEqual(self.escalations("s2", 2000.0)["escalations"], [])
+
+    def test_policy_write_and_query_do_not_touch_events_segments_changes(self):
+        self.submit("s1", "e1", 1000.0, "critical")
+        self.submit("s1", "e2", 1020.0, "warning")
+        with session(self.db_path) as conn:
+            events_before = conn.execute(
+                "SELECT * FROM events ORDER BY id"
+            ).fetchall()
+            segs_before = service.list_segments(conn)
+            changes_before = service.list_segment_changes(conn)
+
+        self.put_policy("s1", [{"severity": "critical", "after_seconds": 10}])
+        self.put_policy("s1", [{"severity": "warning", "after_seconds": 10}])
+        self.escalations("s1", 2000.0)
+        self.escalations("s1", 0.0)
+
+        with session(self.db_path) as conn:
+            self.assertEqual(
+                [tuple(r) for r in conn.execute(
+                    "SELECT * FROM events ORDER BY id"
+                )],
+                [tuple(r) for r in events_before],
+            )
+            self.assertEqual(service.list_segments(conn), segs_before)
+            self.assertEqual(
+                service.list_segment_changes(conn), changes_before
+            )
+
+    def test_queue_reads_consistent_snapshot(self):
+        self.submit("s1", "e1", 1000.0, "critical")
+        self.put_policy("s1", [{"severity": "critical", "after_seconds": 10}])
+        with read_only_session(self.db_path) as conn:
+            r1 = service.list_escalations(conn, source="s1", as_of_ts=2000.0)
+            # 快照开启后写入新事件与新策略，不影响快照内再次读取
+            self.submit("s1", "e2", 1010.0, "critical")
+            self.put_policy("s1", [{"severity": "critical", "after_seconds": 1}])
+            r2 = service.list_escalations(conn, source="s1", as_of_ts=2000.0)
+        self.assertEqual(r1, r2)
+        self.assertEqual(r2["policy_version"], 1)
+        self.assertEqual(len(r2["escalations"]), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

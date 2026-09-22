@@ -1937,3 +1937,310 @@ def test_duration_report_is_read_only(client):
 def test_duration_report_route_not_captured_by_segment_id(client):
     # 静态路径必须优先于 /segments/{segment_id} 匹配，不能返回 422
     assert _duration_report(client, bucket_seconds=60).status_code == 200
+
+
+# ---- 告警升级策略 PUT /escalation-policies/{source} + GET /escalations ----
+
+def _put_policy(client, source, rules):
+    return client.put(f"/escalation-policies/{source}", json={"rules": rules})
+
+
+def _escalations(client, **params):
+    return client.get("/escalations", params=params)
+
+
+def test_put_policy_returns_incrementing_version_per_source(client):
+    r = _put_policy(client, "gw-01", [{"severity": "critical", "after_seconds": 300}])
+    assert r.status_code == 200
+    body = r.json()
+    assert body["source"] == "gw-01"
+    assert body["version"] == 1
+    assert body["rules"] == [{"severity": "critical", "after_seconds": 300.0}]
+    assert body["updated_at"]
+
+    # 每次成功替换 version +1；不同 source 独立从 1 起
+    r = _put_policy(client, "gw-01", [{"severity": "warning", "after_seconds": 60}])
+    assert r.json()["version"] == 2
+    assert r.json()["rules"] == [{"severity": "warning", "after_seconds": 60.0}]
+    r = _put_policy(client, "gw-02", [{"severity": "error", "after_seconds": 10}])
+    assert r.json()["version"] == 1
+    r = _put_policy(client, "gw-01", [])
+    assert r.json()["version"] == 3  # 空规则集也是合法替换
+    assert r.json()["rules"] == []
+
+
+def test_put_policy_normalizes_severity(client):
+    r = _put_policy(client, "gw-01", [
+        {"severity": "WARN", "after_seconds": 60},
+        {"severity": "Fatal", "after_seconds": 30},
+    ])
+    assert r.status_code == 200
+    assert r.json()["rules"] == [
+        {"severity": "warning", "after_seconds": 60.0},
+        {"severity": "critical", "after_seconds": 30.0},
+    ]
+
+
+def test_put_policy_atomic_replace_swaps_entire_rule_set(client):
+    _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z", "critical")
+    _post(client, "gw-01", "e2", "2026-09-20T08:05:00Z", "warning")
+    _put_policy(client, "gw-01", [{"severity": "critical", "after_seconds": 60}])
+    body = _escalations(
+        client, source="gw-01", as_of="2026-09-20T09:00:00Z"
+    ).json()
+    assert [e["max_severity"] for e in body["escalations"]] == ["critical"]
+
+    # 整体替换后旧规则不再生效：critical 段不再到期，warning 段开始匹配
+    _put_policy(client, "gw-01", [{"severity": "warning", "after_seconds": 60}])
+    body = _escalations(
+        client, source="gw-01", as_of="2026-09-20T09:00:00Z"
+    ).json()
+    assert body["policy_version"] == 2
+    assert [e["max_severity"] for e in body["escalations"]] == ["warning"]
+
+
+def test_put_policy_duplicate_severity_rejected(client):
+    r = _put_policy(client, "gw-01", [
+        {"severity": "warning", "after_seconds": 60},
+        {"severity": "warning", "after_seconds": 120},
+    ])
+    assert r.status_code == 422
+    # 归一化后重复（别名/大小写）同样拒绝
+    r = _put_policy(client, "gw-01", [
+        {"severity": "warn", "after_seconds": 60},
+        {"severity": "WARNING", "after_seconds": 120},
+    ])
+    assert r.status_code == 422
+    r = _put_policy(client, "gw-01", [
+        {"severity": "fatal", "after_seconds": 60},
+        {"severity": "critical", "after_seconds": 120},
+    ])
+    assert r.status_code == 422
+
+
+def test_put_policy_non_positive_threshold_rejected(client):
+    for bad in (0, -1, -0.5):
+        r = _put_policy(client, "gw-01", [
+            {"severity": "info", "after_seconds": bad}
+        ])
+        assert r.status_code == 422
+    # 非数字 / 缺失字段 / 非法级别
+    assert _put_policy(client, "gw-01", [
+        {"severity": "info", "after_seconds": "soon"}
+    ]).status_code == 422
+    assert _put_policy(client, "gw-01", [
+        {"severity": "info"}
+    ]).status_code == 422
+    assert _put_policy(client, "gw-01", [
+        {"after_seconds": 60}
+    ]).status_code == 422
+    assert _put_policy(client, "gw-01", [
+        {"severity": "bogus", "after_seconds": 60}
+    ]).status_code == 422
+    assert client.put("/escalation-policies/gw-01", json={}).status_code == 422
+    assert client.put(
+        "/escalation-policies/gw-01", json={"rules": {"severity": "info"}}
+    ).status_code == 422
+
+
+def test_put_policy_failed_update_does_not_bump_version(client):
+    assert _put_policy(
+        client, "gw-01", [{"severity": "info", "after_seconds": 10}]
+    ).json()["version"] == 1
+    # 失败替换不落库、version 不递增
+    assert _put_policy(client, "gw-01", [
+        {"severity": "info", "after_seconds": 10},
+        {"severity": "info", "after_seconds": 20},
+    ]).status_code == 422
+    assert _put_policy(client, "gw-01", [
+        {"severity": "info", "after_seconds": -1}
+    ]).status_code == 422
+    body = _put_policy(client, "gw-01", [{"severity": "error", "after_seconds": 5}])
+    assert body.json()["version"] == 2
+    # 失败替换不改变已生效规则
+    queue = _escalations(
+        client, source="gw-01", as_of="2026-09-20T09:00:00Z"
+    ).json()
+    assert queue["policy_version"] == 2
+
+
+def _three_due_segments(client):
+    # silence=60：段1 [08:00:00,08:00:30] critical；段2 [08:02:00] warning；
+    # 段3 [08:04:00] debug（无匹配规则，永不进队列）
+    _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z", "critical")
+    _post(client, "gw-01", "e2", "2026-09-20T08:00:30Z", "info")
+    _post(client, "gw-01", "e3", "2026-09-20T08:02:00Z", "warning")
+    _post(client, "gw-01", "e4", "2026-09-20T08:04:00Z", "debug")
+
+
+def test_escalations_match_max_severity_and_deadline(client):
+    _three_due_segments(client)
+    _put_policy(client, "gw-01", [
+        {"severity": "critical", "after_seconds": 300},   # 段1 deadline 08:05:00
+        {"severity": "warning", "after_seconds": 60},     # 段2 deadline 08:03:00
+    ])
+
+    # 到期前：空队列
+    body = _escalations(
+        client, source="gw-01", as_of="2026-09-20T08:02:59Z"
+    ).json()
+    assert body["escalations"] == []
+    assert body["policy_version"] == 1
+
+    # as_of 恰好等于 deadline：到期（不早于即含）
+    body = _escalations(
+        client, source="gw-01", as_of="2026-09-20T08:03:00Z"
+    ).json()
+    items = body["escalations"]
+    assert len(items) == 1
+    item = items[0]
+    assert item["max_severity"] == "warning"
+    assert item["after_seconds"] == 60.0
+    assert item["deadline"].replace("Z", "+00:00") == "2026-09-20T08:03:00+00:00"
+    assert item["started_at"].replace("Z", "+00:00") == "2026-09-20T08:02:00+00:00"
+    assert item["last_acknowledgement"] is None
+
+    # 全部到期：debug 段无匹配规则，始终不出现
+    body = _escalations(
+        client, source="gw-01", as_of="2026-09-20T09:00:00Z"
+    ).json()
+    assert [e["max_severity"] for e in body["escalations"]] == [
+        "warning", "critical",
+    ]  # 按 deadline 升序：08:03:00 在 08:05:00 前
+    assert body["source"] == "gw-01"
+    assert body["as_of"].replace("Z", "+00:00") == "2026-09-20T09:00:00+00:00"
+
+
+def test_escalations_sorted_by_deadline_then_segment_id(client):
+    # 段1 critical@08:00（deadline 08:05）；段2 error@08:02（deadline 08:05）；
+    # 段3 warning@08:04（deadline 08:04:30）→ 段3 最先，段1/段2 同刻按 id 升序
+    _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z", "critical")
+    _post(client, "gw-01", "e2", "2026-09-20T08:02:00Z", "error")
+    _post(client, "gw-01", "e3", "2026-09-20T08:04:00Z", "warning")
+    _put_policy(client, "gw-01", [
+        {"severity": "critical", "after_seconds": 300},
+        {"severity": "error", "after_seconds": 180},
+        {"severity": "warning", "after_seconds": 30},
+    ])
+    body = _escalations(
+        client, source="gw-01", as_of="2026-09-20T09:00:00Z"
+    ).json()
+    items = body["escalations"]
+    assert [e["max_severity"] for e in items] == ["warning", "critical", "error"]
+    keys = [(e["deadline"], e["segment_id"]) for e in items]
+    assert keys == sorted(keys)
+    assert items[1]["deadline"] == items[2]["deadline"]
+    assert items[1]["segment_id"] < items[2]["segment_id"]
+
+
+def test_escalations_attach_latest_acknowledgement(client):
+    seg = _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z", "critical")["segment"]
+    _put_policy(client, "gw-01", [{"severity": "critical", "after_seconds": 60}])
+
+    body = _escalations(
+        client, source="gw-01", as_of="2026-09-20T09:00:00Z"
+    ).json()
+    assert body["escalations"][0]["last_acknowledgement"] is None
+
+    ack1 = _ack(client, seg["id"], expected_revision=1, key="k1").json()
+    body = _escalations(
+        client, source="gw-01", as_of="2026-09-20T09:00:00Z"
+    ).json()
+    assert body["escalations"][0]["last_acknowledgement"] == ack1
+
+    # 段变化后再确认：返回最近一次记录
+    _post(client, "gw-01", "e2", "2026-09-20T08:00:30Z", "critical")
+    ack2 = _ack(client, seg["id"], expected_revision=2, key="k2").json()
+    assert ack2["ack_id"] > ack1["ack_id"]
+    body = _escalations(
+        client, source="gw-01", as_of="2026-09-20T09:00:00Z"
+    ).json()
+    assert body["escalations"][0]["last_acknowledgement"] == ack2
+
+
+def test_escalations_track_current_segments_after_withdraw(client):
+    _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z", "critical")
+    _post(client, "gw-01", "e2", "2026-09-20T08:02:00Z", "critical")
+    _post(client, "gw-01", "bridge", "2026-09-20T08:01:00Z", "critical")  # 合并为单段
+    _put_policy(client, "gw-01", [{"severity": "critical", "after_seconds": 120}])
+    body = _escalations(
+        client, source="gw-01", as_of="2026-09-20T08:03:00Z"
+    ).json()
+    assert len(body["escalations"]) == 1  # 单段 [08:00,08:02]，deadline 08:02
+
+    assert client.delete("/events/gw-01/bridge").status_code == 200  # 拆成两段
+    body = _escalations(
+        client, source="gw-01", as_of="2026-09-20T08:03:00Z"
+    ).json()
+    # 拆段后：[08:00]（deadline 08:02 已到期）与 [08:02]（deadline 08:04 未到期）
+    assert len(body["escalations"]) == 1
+    assert body["escalations"][0]["deadline"].replace("Z", "+00:00") == \
+        "2026-09-20T08:02:00+00:00"
+    body = _escalations(
+        client, source="gw-01", as_of="2026-09-20T08:04:00Z"
+    ).json()
+    assert len(body["escalations"]) == 2
+
+
+def test_escalations_unknown_source_returns_empty_queue(client):
+    _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z", "critical")
+    _put_policy(client, "gw-01", [{"severity": "critical", "after_seconds": 60}])
+    body = _escalations(
+        client, source="ghost", as_of="2026-09-20T09:00:00Z"
+    ).json()
+    assert body == {
+        "source": "ghost",
+        "as_of": body["as_of"],
+        "policy_version": None,
+        "escalations": [],
+    }
+    # 有事件但未配置策略的来源同样是空队列
+    body = _escalations(
+        client, source="gw-02", as_of="2026-09-20T09:00:00Z"
+    ).json()
+    assert body["escalations"] == []
+    assert body["policy_version"] is None
+
+
+def test_escalations_as_of_must_carry_timezone(client):
+    _put_policy(client, "gw-01", [{"severity": "critical", "after_seconds": 60}])
+    # 无时区 → 422（与其他接口的"按 UTC 处理"不同，本接口强制显式时区）
+    assert _escalations(
+        client, source="gw-01", as_of="2026-09-20T09:00:00"
+    ).status_code == 422
+    assert _escalations(
+        client, source="gw-01", as_of="2026-09-20 09:00:00"
+    ).status_code == 422
+    # 非法格式 / 缺参数 → 422
+    assert _escalations(
+        client, source="gw-01", as_of="soon"
+    ).status_code == 422
+    assert _escalations(client, source="gw-01").status_code == 422
+    assert _escalations(
+        client, as_of="2026-09-20T09:00:00Z"
+    ).status_code == 422
+    assert _escalations(
+        client, source="", as_of="2026-09-20T09:00:00Z"
+    ).status_code == 422
+    # 带偏移时区合法，响应归一化为 UTC
+    body = _escalations(
+        client, source="gw-01", as_of="2026-09-20T17:00:00+08:00"
+    ).json()
+    assert body["as_of"].replace("Z", "+00:00") == "2026-09-20T09:00:00+00:00"
+
+
+def test_escalation_module_does_not_touch_events_segments_or_changes(client):
+    _three_due_segments(client)
+    segs = client.get("/segments").json()
+    changes = client.get("/segment-changes").json()
+    events = client.get("/events", params={"source": "gw-01"}).json()
+
+    _put_policy(client, "gw-01", [{"severity": "critical", "after_seconds": 60}])
+    _put_policy(client, "gw-01", [{"severity": "warning", "after_seconds": 60}])
+    for _ in range(3):
+        _escalations(client, source="gw-01", as_of="2026-09-20T09:00:00Z")
+        _escalations(client, source="ghost", as_of="2026-09-20T09:00:00Z")
+
+    assert client.get("/segments").json() == segs
+    assert client.get("/segment-changes").json() == changes
+    assert client.get("/events", params={"source": "gw-01"}).json() == events
